@@ -46,6 +46,7 @@ type Result struct {
 	Cancelled bool
 	TimedOut  bool
 	ExitCode  int
+	Duration  int64
 }
 
 // IsError indicates if any error occured in preparing or executing
@@ -174,10 +175,15 @@ func (sc *command) runWithContext(ctx context.Context) *Result {
 	}
 
 	go func() {
-		if err := sc.start(); err == nil {
-			sc.exec()
+		defer sc.Result.SetReady()
+
+		started := time.Now().Unix()
+		if err := sc.start(); err != nil {
+			sc.Result.AddError(err)
+			return
 		}
-		sc.Result.SetReady()
+		sc.exec()
+		sc.Result.Duration = time.Now().Unix() - started
 	}()
 
 	select {

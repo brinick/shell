@@ -27,7 +27,7 @@ func Run(cmd string, options ...Option) *Result {
 // if the context is done.
 func RunWithContext(ctx context.Context, cmd string, options ...Option) *Result {
 	exe := "bash"
-	args := append([]string{"-c"}, cmd)
+	args := append([]string{"-c"}, fmt.Sprintf("%s", cmd))
 
 	shellcmd := newCommand(exe, args, options...)
 	shellcmd.runWithContext(ctx)

@@ -2,57 +2,55 @@ package shell
 
 import (
 	"fmt"
+	"testing"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
-	"reflect"
-	"testing"
 )
 
-func TestBuildCmdArgs(t *testing.T) {
-	tt := []struct {
-		name string
-		cmd  string
-		exe  string
-		args []string
-	}{
-		{"no args", "ls", "ls", []string{}},
-		{"one arg", "ls arg1", "ls", []string{"arg1"}},
-		{"multiple args", "ls -ltr arg1", "ls", []string{"-ltr", "arg1"}},
-	}
-
-	for _, tc := range tt {
-		t.Run(tc.name, func(t *testing.T) {
-			exe, args := buildCmdArgs(tc.cmd)
-			if exe != tc.exe {
-				t.Errorf("Expected %v, got %v", tc.exe, exe)
-			}
-
-			if !(len(tc.args) == 0 && len(args) == 0) {
-				if !reflect.DeepEqual(args, tc.args) {
-					t.Errorf("Expected %v, got %v", tc.args, args)
-				}
-			}
-		})
-	}
-}
-
-func TestTimeout(t *testing.T) {
+func TestTimeoutOption(t *testing.T) {
 	hook := logtest.NewGlobal()
 	log.AddHook(hook)
-	result := Run("sleep 2", Timeout(1))
-	if !result.Killed {
-		t.Errorf("Expected process to be killed, but it was not.")
+	result := Run("sleep 2", Timeout(200*time.Millisecond))
+	if !result.TimedOut {
+		t.Error("Expected process to be marked timed out")
+		t.Log(result)
 	}
 }
 
-func TestEnv(t *testing.T) {
+func TestEnvOption(t *testing.T) {
 	before := Run("env")
 	after := Run("env", Env([]string{"HIP_HIP=hooray"}))
 	missing := missingEntries(after.Stdout.Lines(), before.Stdout.Lines())
 	for _, m := range missing {
 		fmt.Println(m)
 	}
+}
+
+func TestCancelOption(t *testing.T) {
+	stopChan := make(chan struct{})
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(stopChan)
+	}()
+	result := Run("sleep 1", Cancel(stopChan))
+	if !result.Cancelled {
+		t.Error("Expected process to be marked cancelled")
+	}
+}
+
+func TestBkgdOption(t *testing.T) {
+	res := Run("echo 'hello';sleep 1;echo 'world';", Bkgd())
+	if res.IsReady() {
+		t.Error("Background process should still be running")
+	}
+
+	for !res.IsReady() {
+	}
+
+	t.Log(res.Stdout.Text(false))
+	t.Log(res.Stderr.Text(false))
 }
 
 // missingEntries returns the entries in a not in b

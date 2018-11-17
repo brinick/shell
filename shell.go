@@ -6,31 +6,20 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/brinick/logging"
 )
 
 // ------------------------------------------------------------------
 
-// Run executes and waits for a command to complete,
-// returning a Result object. The internal shell command
-// object can be configured via one or more shell.Options.
+// Run executes the command and returns a Result object.
+// The command can be configured via one or more Option functions.
 func Run(cmd string, options ...Option) *Result {
-	return RunWithContext(context.TODO(), cmd, options...)
-}
-
-// RunWithContext execute the command, waiting for it it complete
-// before returning a Result object. The command will abort early
-// if the context is done.
-func RunWithContext(ctx context.Context, cmd string, options ...Option) *Result {
 	exe := "bash"
 	args := append([]string{"-c"}, fmt.Sprintf("%s", cmd))
 
 	shellcmd := newCommand(exe, args, options...)
-	shellcmd.runWithContext(ctx)
+	shellcmd.run()
 	return shellcmd.Result
 }
 
@@ -38,15 +27,35 @@ func RunWithContext(ctx context.Context, cmd string, options ...Option) *Result 
 
 // Result is the wrapper
 type Result struct {
-	Stdout    resultOutput // stdout
-	Stderr    resultOutput // stderr
-	done      chan struct{}
-	Error     resultError
-	Killed    bool
+	Stdout   resultOutput
+	Stderr   resultOutput
+	done     chan struct{}
+	Error    resultError
+	ExitCode int
+	Duration int64
+
+	// Something panicked - process died
+	Crashed bool
+
+	// Context timed out - process killed
+	TimedOut bool
+
+	// Context cancelled - process killed
 	Cancelled bool
-	TimedOut  bool
-	ExitCode  int
-	Duration  int64
+}
+
+func (r *Result) String() string {
+	return strings.Join(
+		[]string{
+			fmt.Sprintf("Done? %t", r.IsReady()),
+			fmt.Sprintf("Crashed?: %t", r.Crashed),
+			fmt.Sprintf("TimedOut?: %t", r.TimedOut),
+			fmt.Sprintf("Cancelled?: %t", r.Cancelled),
+			fmt.Sprintf("Error?: %t", r.IsError()),
+			fmt.Sprintf("ErrMsg: %s", r.Error),
+		},
+		" - ",
+	)
 }
 
 // IsError indicates if any error occured in preparing or executing
@@ -60,6 +69,15 @@ func (r *Result) AddError(e error) {
 	r.Error.Append(e)
 }
 
+func (r *Result) IsReady() bool {
+	select {
+	case <-r.Ready():
+		return true
+	default:
+		return false
+	}
+}
+
 // Ready can be used to indicate if the given Result is available
 func (r *Result) Ready() <-chan struct{} {
 	return r.done
@@ -67,7 +85,13 @@ func (r *Result) Ready() <-chan struct{} {
 
 // SetReady will declare this Result ready
 func (r *Result) SetReady() {
-	r.done <- struct{}{}
+	// allows for the possibility of multiple closure attempts
+	select {
+	case <-r.done:
+		// already closed
+	default:
+		close(r.done)
+	}
 }
 
 // ------------------------------------------------------------------
@@ -97,7 +121,12 @@ func (re resultError) String() string {
 
 // resultOutput wraps a bytes buffer
 type resultOutput struct {
-	b *bytes.Buffer
+	b    *bytes.Buffer
+	step int
+}
+
+func (r *resultOutput) Next() []byte {
+	return r.b.Next(r.step)
 }
 
 // Text returns the output as a string, stripped of pre/suf-fixed
@@ -117,15 +146,52 @@ func (r *resultOutput) Lines() []string {
 
 // -------------------------------------------------------------
 
+// command creates a new shell command
+func newCommand(executable string, args []string, options ...Option) *command {
+	s := &command{
+		exe:  executable,
+		args: args,
+		c:    exec.Command(executable, args...),
+		ctx:  context.TODO(),
+		Result: &Result{
+			Stdout: resultOutput{&bytes.Buffer{}, 2048},
+			Stderr: resultOutput{&bytes.Buffer{}, 2048},
+			done:   make(chan struct{}, 3), // to ensure we don't block
+		},
+	}
+
+	for _, option := range options {
+		option(s)
+	}
+
+	var env = s.env
+	if len(env) == 0 {
+		// TODO: is this necessary? Presumably by default
+		// commands inherit the parent environment if not set explicitly
+		env = os.Environ()
+	}
+
+	s.c.Env = env
+
+	s.c.Stdout = s.Result.Stdout.b
+	s.c.Stderr = s.Result.Stderr.b
+
+	return s
+}
+
+// ------------------------------------------------------------------
+
 // command represents a given shell command
 type command struct {
-	exe     string          // the name or path to the executable
-	args    []string        // args passed to the executable
-	env     []string        // specific vars that were set/unset
-	c       *exec.Cmd       // the wrapped command object
-	Result  *Result         // the result object
-	timeout int             // 0 = no timeout
+	exe     string        // the name or path to the executable
+	args    []string      // args passed to the executable
+	env     []string      // specific vars that were set/unset
+	c       *exec.Cmd     // the wrapped command object
+	Result  *Result       // the result object
+	timeout time.Duration // 0 = no timeout
+	ctx     context.Context
 	stop    <-chan struct{} // tell the command to stop
+	bkgd    bool            // run in background or not
 }
 
 // ------------------------------------------------------------------
@@ -147,6 +213,7 @@ func (sc *command) start() error {
 
 // ------------------------------------------------------------------
 
+/*
 func (sc *command) exec() error {
 	if err := sc.c.Wait(); err != nil {
 		sc.Result.AddError(err)
@@ -155,36 +222,52 @@ func (sc *command) exec() error {
 
 	return nil
 }
+*/
 
 // ------------------------------------------------------------------
 
-// runWithContext will execute the given shell command returning a Result.
-// The caller may stop the command by calling the command.Stop() method.
-// Alternatively, a timeout may be provided to place an upper bound.
-func (sc *command) runWithContext(ctx context.Context) *Result {
-	defer func() {
-		sc.Result.SetReady()
-	}()
-
+// run will launch the given shell command, returning once the
+// command is done, or immediately if the Bkgd Option was set.
+func (sc *command) run() {
 	if sc.timeout > 0 {
 		// augment the context
 		var cancelTimeout context.CancelFunc
-		duration := time.Duration(sc.timeout) * time.Second
-		ctx, cancelTimeout = context.WithTimeout(ctx, duration)
+		sc.ctx, cancelTimeout = context.WithTimeout(sc.ctx, sc.timeout)
 		defer cancelTimeout()
 	}
 
-	go func() {
-		defer sc.Result.SetReady()
+	go sc.launch()
 
-		started := time.Now().Unix()
-		if err := sc.start(); err != nil {
-			sc.Result.AddError(err)
-			return
+	if sc.bkgd {
+		go sc.wait()
+		return
+	}
+
+	sc.wait()
+}
+
+func (sc *command) launch() {
+	defer func() {
+		if r := recover(); r != nil {
+			sc.Result.Crashed = true
+			sc.Result.AddError(fmt.Errorf("Crashed with: %s", r))
 		}
-		sc.exec()
-		sc.Result.Duration = time.Now().Unix() - started
+		sc.Result.SetReady()
 	}()
+
+	started := time.Now().Unix()
+	if err := sc.c.Run(); err != nil {
+		sc.Result.AddError(err)
+	}
+
+	fmt.Println("STDOUT EXISTS?", sc.c.Stdout == nil)
+	sc.Result.Duration = time.Now().Unix() - started
+}
+
+// ------------------------------------------------------------------
+
+func (sc *command) wait() {
+	defer sc.Result.SetReady()
 
 	select {
 	case <-sc.stop:
@@ -193,9 +276,8 @@ func (sc *command) runWithContext(ctx context.Context) *Result {
 		sc.kill()
 	case <-sc.Result.Ready():
 		// all ok, process is done
-	case <-ctx.Done():
-		err := ctx.Err()
-		// not sure what context expired, let's check
+	case <-sc.ctx.Done():
+		err := sc.ctx.Err()
 		switch err {
 		case context.DeadlineExceeded:
 			sc.Result.TimedOut = true
@@ -205,22 +287,12 @@ func (sc *command) runWithContext(ctx context.Context) *Result {
 		sc.Result.AddError(err)
 		sc.kill()
 	}
-
-	return sc.Result
-}
-
-// ------------------------------------------------------------------
-
-func (sc *command) run() *Result {
-	return sc.runWithContext(context.TODO())
 }
 
 // ------------------------------------------------------------------
 
 // Kill will terminate the internal exec.Cmd.Process
 func (sc *command) kill() error {
-	sc.Result.Killed = true
-
 	if err := sc.c.Process.Kill(); err != nil {
 		sc.Result.AddError(err)
 		return err
@@ -230,21 +302,51 @@ func (sc *command) kill() error {
 }
 
 // ------------------------------------------------------------------
+// ------------------------------------------------------------------
+// ------------------------------------------------------------------
 
 // Option is a function that modifies the given shell command
 type Option func(s *command)
 
-// Timeout is an Option to provide a timed shell command
-func Timeout(secs int) func(*command) {
+// Context is an Option to set a context on the command
+// that will interrupt the command if the context is done.
+// Only the last call to this function will be taken into
+// account.
+func Context(ctx context.Context) Option {
 	return func(s *command) {
-		if secs > 0 {
-			s.timeout = secs
+		s.ctx = ctx
+	}
+}
+
+// Bkgd is an Option to run the command in the background
+// and return a Result object immediately that will be
+// filled in later. Using this one can access the Result
+// Stdout/Stderr streams in real-time. When this option
+// is not set, the Run function will block until the command
+// is done, only then returning a Result object. This is
+// the default.
+func Bkgd() Option {
+	return func(s *command) {
+		s.bkgd = true
+	}
+}
+
+// Timeout is an Option to provide a timed shell command.
+// Only the last call to this funcion will be taken into account.
+// By default, commands do not timeout.
+func Timeout(d time.Duration) Option {
+	return func(s *command) {
+		if d > 0 {
+			s.timeout = d
 		}
 	}
 }
 
-// Env is an Option to modify the shell command's execution environment
-func Env(values []string) func(*command) {
+// Env is an Option to modify the shell command's
+// execution environment. Multiple calls to this function
+// will be taken into account, with all values passed
+// appended into a single slice.
+func Env(values []string) Option {
 	return func(s *command) {
 		if len(s.env) > 0 {
 			s.env = append(s.env, values...)
@@ -254,8 +356,8 @@ func Env(values []string) func(*command) {
 	}
 }
 
-// Cancel provides a channel that can be used to tell the ongoing
-// command to stop running
+// Cancel is an Option to provide a channel whose writing to,
+// or closing, will indicate that the command should stop
 func Cancel(stop <-chan struct{}) func(*command) {
 	return func(s *command) {
 		s.stop = stop
@@ -263,192 +365,3 @@ func Cancel(stop <-chan struct{}) func(*command) {
 }
 
 // ------------------------------------------------------------------
-
-// command creates a new shell command
-func newCommand(executable string, args []string, options ...Option) *command {
-	s := &command{
-		exe:  executable,
-		args: args,
-		c:    exec.Command(executable, args...),
-		Result: &Result{
-			Stdout: resultOutput{&bytes.Buffer{}},
-			Stderr: resultOutput{&bytes.Buffer{}},
-			done:   make(chan struct{}, 3), // to ensure we don't block
-		},
-	}
-
-	for _, option := range options {
-		option(s)
-	}
-
-	var env = s.env
-	if len(env) == 0 {
-		env = os.Environ()
-	}
-
-	s.c.Env = env
-	s.c.Stdout = s.Result.Stdout.b
-	s.c.Stderr = s.Result.Stderr.b
-
-	return s
-}
-
-// ------------------------------------------------------------------
-
-// DirTreeSize walks the tree starting at root directory,
-// and totals the size of all files it finds. Directories
-// matching entries in the excludeDirs list are not traversed.
-// The grand total in bytes is returned.
-func DirTreeSize(root string, excludeDirs []string) (int64, error) {
-	totSize := int64(0)
-	err := filepath.Walk(
-		root,
-		func(path string, pathInfo os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-
-			if pathInfo.IsDir() {
-				for _, e := range excludeDirs {
-					if pathInfo.Name() == e {
-						return filepath.SkipDir
-					}
-				}
-			} else {
-				totSize += pathInfo.Size()
-			}
-
-			return nil
-		},
-	)
-
-	return totSize, err
-}
-
-// DirDepth returns the integer number of directories that
-// path is below root. If root is not a prefix of path, it
-// returns 0. If path is a file, the depth is calculated with
-// respect to the parent directory of the file.
-func DirDepth(root, path string) (int, error) {
-	// TODO: what if root or path are relative?
-	if strings.HasSuffix(root, "/") {
-		root = root[:len(root)-1]
-	}
-	if strings.HasSuffix(path, "/") {
-		path = path[:len(path)-1]
-	}
-	if root == path {
-		return 0, nil
-	}
-
-	if !strings.HasPrefix(path, root) {
-		return 0, fmt.Errorf("%s not a prefix of %s", root, path)
-	}
-
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, err
-	}
-
-	if !info.IsDir() {
-		path = filepath.Dir(path)
-	}
-
-	path = strings.Replace(path, root, "", 1)
-	path = strings.Trim(path, "/")
-	dirs := strings.Split(path, "/")
-	return len(dirs), nil
-}
-
-// WalkTree walks the tree starting from root, returning
-// all directories and files found. If maxDepth is > 0,
-// the walk will truncate below this many levels. Directories
-// in the excludeDirs slice will be ignored.
-func WalkTree(root string, excludeDirs []string, maxdepth int) ([]string, []string, error) {
-	dirs := []string{}
-	files := []string{}
-
-	currDepth := func(path string) int {
-		depth, _ := DirDepth(root, path)
-		return depth
-	}
-
-	err := filepath.Walk(
-		root,
-		func(path string, pathInfo os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-
-			if !pathInfo.IsDir() {
-				files = append(files, path)
-			} else {
-				if maxdepth > 0 && currDepth(path) > maxdepth {
-					return filepath.SkipDir
-				}
-
-				for _, e := range excludeDirs {
-					if pathInfo.Name() == e {
-						return filepath.SkipDir
-					}
-				}
-
-				dirs = append(dirs, path)
-			}
-
-			return nil
-		},
-	)
-
-	return dirs, files, err
-}
-
-// FindDirs finds all directories matching a given dir name
-// glob, or exact name, below the given start directory.
-// The search goes at most max depth directories down.
-func FindDirs(startDir, dirNameGlob string, maxDepth int, ignore []string) ([]string, error) {
-	dirs, _, err := WalkTree(startDir, ignore, maxDepth)
-	var matches []string
-	for _, d := range dirs {
-		matched, _ := filepath.Match(dirNameGlob, filepath.Base(d))
-		if matched {
-			matches = append(matches, d)
-		}
-	}
-	return matches, err
-}
-
-// FindFiles finds all files matching a given file name glob, or exact name,
-// below the given start directory. The search goes at most max depth
-// directories down.
-func FindFiles(startDir, fileNameGlob string, maxDepth int, ignore []string) ([]string, error) {
-	_, files, err := WalkTree(startDir, ignore, maxDepth)
-	var matches []string
-	for _, f := range files {
-		matched, _ := filepath.Match(fileNameGlob, filepath.Base(f))
-		if matched {
-			matches = append(matches, f)
-		}
-	}
-	return matches, err
-}
-
-// RemoveFiles will delete files matching the given file name glob,
-// found at most maxDepth directories below startDir
-func RemoveFiles(startDir, fileNameGlob string, maxDepth int, ignore []string) error {
-	logging.Error("Removing files!!!")
-	files, err := FindFiles(startDir, fileNameGlob, maxDepth, ignore)
-	if err != nil {
-		logging.Error("oops", logging.F("err", err))
-		return err
-	}
-
-	logging.Error("files found?", logging.F("n", len(files)))
-
-	for _, file := range files {
-		logging.Error(fmt.Sprintf("Removing %s", file))
-		os.Remove(file)
-	}
-
-	return nil
-}

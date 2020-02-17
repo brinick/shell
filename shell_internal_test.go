@@ -22,7 +22,10 @@ func TestTimeoutOption(t *testing.T) {
 func TestEnvOption(t *testing.T) {
 	before := Run("env")
 	after := Run("env", Env([]string{"HIP_HIP=hooray"}))
-	missing := missingEntries(after.Stdout.Lines(), before.Stdout.Lines())
+	missing := missingEntries(
+		after.Stdout().Lines(),
+		before.Stdout().Lines(),
+	)
 	for _, m := range missing {
 		fmt.Println(m)
 	}
@@ -49,8 +52,8 @@ func TestBkgdOption(t *testing.T) {
 	for !res.IsReady() {
 	}
 
-	t.Log(res.Stdout.Text(false))
-	t.Log(res.Stderr.Text(false))
+	t.Log(res.Stdout().Text())
+	t.Log(res.Stderr().Text())
 }
 
 // missingEntries returns the entries in a not in b

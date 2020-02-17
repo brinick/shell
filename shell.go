@@ -1,22 +1,22 @@
 package shell
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/go-cmd/cmd"
 )
 
 // ------------------------------------------------------------------
 
 // Run executes the command and returns a Result object.
 // The command can be configured via one or more Option functions.
-func Run(cmd string, options ...Option) *Result {
-	exe := "bash"
-	args := append([]string{"-c"}, fmt.Sprintf("%s", cmd))
+func Run(command string, options ...Option) *Result {
+	exe := "/bin/bash"
+	args := append([]string{"-c"}, fmt.Sprintf("%s", command))
 
 	shellcmd := newCommand(exe, args, options...)
 	shellcmd.run()
@@ -27,255 +27,203 @@ func Run(cmd string, options ...Option) *Result {
 
 // Result is the wrapper
 type Result struct {
-	Stdout   resultOutput
-	Stderr   resultOutput
-	done     chan struct{}
-	Error    resultError
-	ExitCode int
-	Duration int64
-
 	// Something panicked - process died
-	Crashed bool
+	Crashed     bool
+	CrashReason string
 
 	// Context timed out - process killed
 	TimedOut bool
 
 	// Context cancelled - process killed
 	Cancelled bool
+
+	current func() cmd.Status
+	final   *cmd.Status
+	done    func() <-chan struct{}
+
+	nStdout int
+	nStderr int
 }
 
-func (r *Result) String() string {
-	return strings.Join(
-		[]string{
-			fmt.Sprintf("Done? %t", r.IsReady()),
-			fmt.Sprintf("Crashed?: %t", r.Crashed),
-			fmt.Sprintf("TimedOut?: %t", r.TimedOut),
-			fmt.Sprintf("Cancelled?: %t", r.Cancelled),
-			fmt.Sprintf("Error?: %t", r.IsError()),
-			fmt.Sprintf("ErrMsg: %s", r.Error),
-		},
-		" - ",
-	)
-}
-
-// IsError indicates if any error occured in preparing or executing
-// the shell command
-func (r *Result) IsError() bool {
-	return r.Error != nil && len(r.Error) > 0
-}
-
-// AddError appends the given error to the ResultError list
-func (r *Result) AddError(e error) {
-	r.Error.Append(e)
-}
-
+// IsReady returns a bool indicating if the command
+// is done, and the Result object useable
 func (r *Result) IsReady() bool {
+	if r == nil {
+		return false
+	}
 	select {
-	case <-r.Ready():
+	case <-r.done():
 		return true
 	default:
 		return false
 	}
 }
 
-// Ready can be used to indicate if the given Result is available
+// Ready returns a channel to indicate if
+// the command is done
 func (r *Result) Ready() <-chan struct{} {
-	return r.done
+	return r.done()
 }
 
-// SetReady will declare this Result ready
-func (r *Result) SetReady() {
-	// allows for the possibility of multiple closure attempts
-	select {
-	case <-r.done:
-		// already closed
-	default:
-		close(r.done)
+func (r *Result) status() *cmd.Status {
+	if r.final != nil {
+		return r.final
 	}
+
+	curr := r.current()
+	return &curr
+}
+
+// ExitCode returns the exit code of the process
+func (r *Result) ExitCode() int {
+	return r.status().Exit
+}
+
+// PID returns the process PID of the command
+func (r *Result) PID() int {
+	return r.status().PID
+}
+
+// Duration indicates for how long the command ran
+func (r *Result) Duration() float64 {
+	return r.status().Runtime
+}
+
+func (r *Result) Stdout() *Output {
+	lines := r.status().Stdout[r.nStdout:]
+	r.nStdout += len(lines)
+	return &Output{lines}
+}
+
+func (r *Result) Stderr() *Output {
+	lines := r.status().Stderr[r.nStderr:]
+	r.nStderr += len(lines)
+	return &Output{lines}
+}
+
+// IsError indicates if any error occured in preparing or executing
+// the shell command. This will return false if the command ran ok,
+// but just had a non-zero exit code.
+func (r *Result) IsError() bool {
+	return r.Error() != nil
+}
+
+// Error returns an eventual error from running the command
+func (r *Result) Error() error {
+	return r.status().Error
 }
 
 // ------------------------------------------------------------------
 
-// resultError is a type that aggregates shell command errors
-type resultError []error
-
-func (re resultError) Error() string {
-	s := []string{}
-	for _, e := range re {
-		s = append(s, e.Error())
-	}
-
-	return strings.Join(s, "\n")
+// Output is a structure to wrap the shell command output stream
+type Output struct {
+	lines []string
 }
 
-// Append will add the given error to the list of errors
-func (re *resultError) Append(e error) {
-	*re = append(*re, e)
+// Empty checks if there is any output
+func (o *Output) Empty() bool {
+	return len(o.lines) == 0
 }
 
-func (re resultError) String() string {
-	return re.Error()
+// Lines returns the output as newline split list of lines
+func (o *Output) Lines() []string {
+	return o.lines
 }
 
-// -------------------------------------------------------------
-
-// resultOutput wraps a bytes buffer
-type resultOutput struct {
-	b    *bytes.Buffer
-	step int
-}
-
-func (r *resultOutput) Next() []byte {
-	return r.b.Next(r.step)
-}
-
-// Text returns the output as a string, stripped of pre/suf-fixed
-// whitespace and, optionally, of any trailing return chars
-func (r *resultOutput) Text(stripNewLine bool) string {
-	val := strings.TrimSpace(string(r.b.Bytes()))
-	if !stripNewLine {
-		return val
-	}
-	return strings.TrimSuffix(val, "\n")
-}
-
-// Lines returns the output as a slice of strings
-func (r *resultOutput) Lines() []string {
-	return strings.Split(r.Text(false), "\n")
-}
-
-// -------------------------------------------------------------
-
-// command creates a new shell command
-func newCommand(executable string, args []string, options ...Option) *command {
-	s := &command{
-		exe:  executable,
-		args: args,
-		c:    exec.Command(executable, args...),
-		ctx:  context.TODO(),
-		Result: &Result{
-			Stdout: resultOutput{&bytes.Buffer{}, 2048},
-			Stderr: resultOutput{&bytes.Buffer{}, 2048},
-			done:   make(chan struct{}, 3), // to ensure we don't block
-		},
-	}
-
-	for _, option := range options {
-		option(s)
-	}
-
-	var env = s.env
-	if len(env) == 0 {
-		// TODO: is this necessary? Presumably by default
-		// commands inherit the parent environment if not set explicitly
-		env = os.Environ()
-	}
-
-	s.c.Env = env
-
-	s.c.Stdout = s.Result.Stdout.b
-	s.c.Stderr = s.Result.Stderr.b
-
-	return s
+// Text returns the output as a single string
+func (o *Output) Text() string {
+	return strings.Join(o.lines, "\n")
 }
 
 // ------------------------------------------------------------------
 
 // command represents a given shell command
 type command struct {
-	exe     string        // the name or path to the executable
-	args    []string      // args passed to the executable
-	env     []string      // specific vars that were set/unset
-	c       *exec.Cmd     // the wrapped command object
-	Result  *Result       // the result object
-	timeout time.Duration // 0 = no timeout
+	c      *cmd.Cmd // the wrapped command object
+	Result *Result  // the result object
+
+	// options
+	env     []string
 	ctx     context.Context
-	stop    <-chan struct{} // tell the command to stop
-	bkgd    bool            // run in background or not
+	stop    <-chan struct{}
+	bkgd    bool
+	timeout time.Duration // 0 = no timeout
 }
 
 // ------------------------------------------------------------------
 
-func (sc *command) String() string {
-	return fmt.Sprintf("%s %s", sc.exe, strings.Join(sc.args, " "))
-}
-
-// ------------------------------------------------------------------
-
-func (sc *command) start() error {
-	if err := sc.c.Start(); err != nil {
-		sc.Result.AddError(err)
-		return err
+// newCommand creates a new shell command
+func newCommand(executable string, args []string, options ...Option) *command {
+	s := &command{
+		ctx:    context.TODO(),
+		c:      cmd.NewCmd(executable, args...),
+		Result: &Result{},
 	}
 
-	return nil
-}
-
-// ------------------------------------------------------------------
-
-/*
-func (sc *command) exec() error {
-	if err := sc.c.Wait(); err != nil {
-		sc.Result.AddError(err)
-		return err
+	for _, option := range options {
+		option(s)
 	}
 
-	return nil
+	s.c.Env = s.env
+	s.Result.done = s.c.Done
+	s.Result.current = s.c.Status
+
+	return s
 }
-*/
 
 // ------------------------------------------------------------------
 
-// run will launch the given shell command, returning once the
-// command is done, or immediately if the Bkgd Option was set.
+// run will launch the given shell command, returning once the command is done
 func (sc *command) run() {
-	if sc.timeout > 0 {
-		// augment the context
-		var cancelTimeout context.CancelFunc
-		sc.ctx, cancelTimeout = context.WithTimeout(sc.ctx, sc.timeout)
-		defer cancelTimeout()
-	}
-
-	go sc.launch()
-
-	if sc.bkgd {
-		go sc.wait()
-		return
-	}
-
-	sc.wait()
-}
-
-func (sc *command) launch() {
 	defer func() {
 		if r := recover(); r != nil {
 			sc.Result.Crashed = true
-			sc.Result.AddError(fmt.Errorf("Crashed with: %s", r))
+			sc.Result.CrashReason = r.(string)
 		}
-		sc.Result.SetReady()
 	}()
 
-	started := time.Now().Unix()
-	if err := sc.c.Run(); err != nil {
-		sc.Result.AddError(err)
+	var (
+		timeoutAdded = make(chan struct{})
+		statusChan   <-chan cmd.Status
+	)
+
+	go func() {
+		if sc.timeout > 0 {
+			// augment the context
+			var cancelTimeout context.CancelFunc
+			sc.ctx, cancelTimeout = context.WithTimeout(sc.ctx, sc.timeout)
+			defer cancelTimeout()
+		}
+		close(timeoutAdded)
+
+		// exit only when the command is done, so as not to
+		// prematurely invoke the deferred timeout cancel
+		<-sc.Result.Ready()
+	}()
+
+	// block until the other routine has augmented
+	// any timeout to the shell command instance
+	<-timeoutAdded
+
+	statusChan = sc.c.Start()
+	if sc.bkgd {
+		go sc.wait(statusChan)
+		return
 	}
 
-	fmt.Println("STDOUT EXISTS?", sc.c.Stdout == nil)
-	sc.Result.Duration = time.Now().Unix() - started
+	sc.wait(statusChan)
 }
 
 // ------------------------------------------------------------------
 
-func (sc *command) wait() {
-	defer sc.Result.SetReady()
-
+func (sc *command) wait(statusChan <-chan cmd.Status) {
 	select {
+	case final := <-statusChan:
+		// process is done; grab the final full output
+		sc.Result.final = &final
 	case <-sc.stop:
 		sc.Result.Cancelled = true
-		sc.Result.AddError(fmt.Errorf("Cancelled"))
 		sc.kill()
-	case <-sc.Result.Ready():
-		// all ok, process is done
 	case <-sc.ctx.Done():
 		err := sc.ctx.Err()
 		switch err {
@@ -284,21 +232,15 @@ func (sc *command) wait() {
 		case context.Canceled:
 			sc.Result.Cancelled = true
 		}
-		sc.Result.AddError(err)
 		sc.kill()
 	}
 }
 
 // ------------------------------------------------------------------
 
-// Kill will terminate the internal exec.Cmd.Process
-func (sc *command) kill() error {
-	if err := sc.c.Process.Kill(); err != nil {
-		sc.Result.AddError(err)
-		return err
-	}
-
-	return nil
+// Kill will terminate the internal cmd.Cmd
+func (sc *command) kill() {
+	sc.c.Stop()
 }
 
 // ------------------------------------------------------------------
@@ -315,19 +257,6 @@ type Option func(s *command)
 func Context(ctx context.Context) Option {
 	return func(s *command) {
 		s.ctx = ctx
-	}
-}
-
-// Bkgd is an Option to run the command in the background
-// and return a Result object immediately that will be
-// filled in later. Using this one can access the Result
-// Stdout/Stderr streams in real-time. When this option
-// is not set, the Run function will block until the command
-// is done, only then returning a Result object. This is
-// the default.
-func Bkgd() Option {
-	return func(s *command) {
-		s.bkgd = true
 	}
 }
 
@@ -361,6 +290,12 @@ func Env(values []string) Option {
 func Cancel(stop <-chan struct{}) func(*command) {
 	return func(s *command) {
 		s.stop = stop
+	}
+}
+
+func Bkgd() func(*command) {
+	return func(s *command) {
+		s.bkgd = true
 	}
 }
 

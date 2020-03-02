@@ -28,14 +28,14 @@ func Run(command string, options ...Option) *Result {
 // Result is the wrapper
 type Result struct {
 	// Something panicked - process died
-	Crashed     bool
-	CrashReason string
+	crashed     bool
+	crashReason string
 
 	// Context timed out - process killed
-	TimedOut bool
+	timedOut bool
 
-	// Context cancelled - process killed
-	Cancelled bool
+	// Context canceled - process killed
+	canceled bool
 
 	current func() cmd.Status
 	final   *cmd.Status
@@ -89,12 +89,16 @@ func (r *Result) Duration() float64 {
 	return r.status().Runtime
 }
 
+// Stdout returns an Output object wrapping the latest lines
+// from the stdout stream
 func (r *Result) Stdout() *Output {
 	lines := r.status().Stdout[r.nStdout:]
 	r.nStdout += len(lines)
 	return &Output{lines}
 }
 
+// Stderr returns an Output object wrapping the latest lines
+// from the stderr stream
 func (r *Result) Stderr() *Output {
 	lines := r.status().Stderr[r.nStderr:]
 	r.nStderr += len(lines)
@@ -111,6 +115,21 @@ func (r *Result) IsError() bool {
 // Error returns an eventual error from running the command
 func (r *Result) Error() error {
 	return r.status().Error
+}
+
+// Crashed indicates if the command crashed
+func (r *Result) Crashed() bool {
+	return r.crashed
+}
+
+// Canceled indicates if the command Context was canceled
+func (r *Result) Canceled() bool {
+	return r.canceled
+}
+
+// TimedOut indicates if the command Context timed out
+func (r *Result) TimedOut() bool {
+	return r.timedOut
 }
 
 // ------------------------------------------------------------------
@@ -177,8 +196,8 @@ func newCommand(executable string, args []string, options ...Option) *command {
 func (sc *command) run() {
 	defer func() {
 		if r := recover(); r != nil {
-			sc.Result.Crashed = true
-			sc.Result.CrashReason = r.(string)
+			sc.Result.crashed = true
+			sc.Result.crashReason = r.(string)
 		}
 	}()
 
@@ -222,15 +241,15 @@ func (sc *command) wait(statusChan <-chan cmd.Status) {
 		// process is done; grab the final full output
 		sc.Result.final = &final
 	case <-sc.stop:
-		sc.Result.Cancelled = true
+		sc.Result.canceled = true
 		sc.kill()
 	case <-sc.ctx.Done():
 		err := sc.ctx.Err()
 		switch err {
 		case context.DeadlineExceeded:
-			sc.Result.TimedOut = true
+			sc.Result.timedOut = true
 		case context.Canceled:
-			sc.Result.Cancelled = true
+			sc.Result.canceled = true
 		}
 		sc.kill()
 	}
@@ -293,6 +312,7 @@ func Cancel(stop <-chan struct{}) func(*command) {
 	}
 }
 
+// Bkgd is an Option to make the command run in the background
 func Bkgd() func(*command) {
 	return func(s *command) {
 		s.bkgd = true

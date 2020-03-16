@@ -109,11 +109,11 @@ func (r *Result) Stderr() *Output {
 // the shell command. This will return false if the command ran ok,
 // but just had a non-zero exit code.
 func (r *Result) IsError() bool {
-	return r.Error() != nil
+	return r.Err() != nil
 }
 
-// Error returns an eventual error from running the command
-func (r *Result) Error() error {
+// Err returns an eventual error from running the command
+func (r *Result) Err() error {
 	return r.status().Error
 }
 

@@ -122,7 +122,7 @@ func TestErrorValues(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := Run(tt.cmd).Error()
+			got := Run(tt.cmd).Err()
 			if got != tt.expect {
 				t.Errorf("%s: expected exit code %v, got %v\n", tt.name, tt.expect, got)
 			}

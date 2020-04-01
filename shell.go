@@ -122,6 +122,12 @@ func (r *Result) Crashed() bool {
 	return r.crashed
 }
 
+// CrashReason returns the cause of the crash, or empty string
+// if there was no crash
+func (r *Result) CrashReason() string {
+	return r.crashReason
+}
+
 // Canceled indicates if the command Context was canceled
 func (r *Result) Canceled() bool {
 	return r.canceled

@@ -51,10 +51,14 @@ func TestBkgdOption(t *testing.T) {
 	}
 
 	for !res.IsReady() {
+		t.Log("Process is bkgd'ed, waiting...")
+		t.Log(res.Stdout().Text())
+		t.Log(res.Stderr().Text())
+		<-time.After(500 * time.Millisecond)
 	}
-
 	t.Log(res.Stdout().Text())
 	t.Log(res.Stderr().Text())
+
 }
 
 func TestStdOutputs(t *testing.T) {
